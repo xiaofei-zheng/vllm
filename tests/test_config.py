@@ -238,9 +238,8 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
 
 
-def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):
-    """ROCm keeps the DSA models (DeepSeek V3.2/V4, GLM-5.2) on their compiled
-    MRV1 paths and off breakable cudagraphs by default."""
+def test_rocm_keeps_dsa_on_mrv1_without_breakable_cudagraphs(monkeypatch):
+    """ROCm keeps the DSA models on MRV1 and off breakable graphs by default."""
     from vllm.config.vllm import (
         ROCM_DEFAULT_MRV1_ARCHITECTURES,
         default_breakable_cudagraph_architectures,
@@ -352,18 +351,198 @@ def test_dsa_breakable_cudagraph_platform_default(
     config = SimpleNamespace(
         model_config=SimpleNamespace(architectures=[architecture]),
         compilation_config=CompilationConfig(),
+        optimization_level=OptimizationLevel.O2,
     )
     config._uses_breakable_cudagraph_by_default = lambda: (
         VllmConfig._uses_breakable_cudagraph_by_default(config)
+    )
+    config._has_breakable_cudagraph_architecture = lambda: (
+        VllmConfig._has_breakable_cudagraph_architecture(config)
     )
 
     try:
         assert VllmConfig._maybe_enable_breakable_cudagraph(config) is expected
         if expected:
             assert config.compilation_config.mode == CompilationMode.NONE
+        else:
+            assert config.compilation_config.mode == CompilationMode.NONE
+            assert (
+                config.compilation_config.cudagraph_mode
+                == CUDAGraphMode.FULL_DECODE_ONLY
+            )
     finally:
         os.environ.pop("VLLM_USE_BREAKABLE_CUDAGRAPH", None)
         default_breakable_cudagraph_architectures.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    sorted(vllm_config_module.DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES),
+)
+def test_rocm_breakable_architectures_fall_back_to_full_decode(
+    monkeypatch, architecture
+):
+    from vllm.config.vllm import default_breakable_cudagraph_architectures
+    from vllm.platforms import current_platform
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    default_breakable_cudagraph_architectures.cache_clear()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=[architecture]),
+        compilation_config=CompilationConfig(),
+        optimization_level=OptimizationLevel.O2,
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: (
+        VllmConfig._uses_breakable_cudagraph_by_default(config)
+    )
+    config._has_breakable_cudagraph_architecture = lambda: (
+        VllmConfig._has_breakable_cudagraph_architecture(config)
+    )
+
+    try:
+        assert not VllmConfig._maybe_enable_breakable_cudagraph(config)
+        assert config.compilation_config.mode == CompilationMode.NONE
+        assert (
+            config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+        )
+    finally:
+        default_breakable_cudagraph_architectures.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("optimization_level", "expected_cudagraph_mode"),
+    [
+        (OptimizationLevel.O0, CUDAGraphMode.NONE),
+        (OptimizationLevel.O1, CUDAGraphMode.NONE),
+        (OptimizationLevel.O2, CUDAGraphMode.FULL_DECODE_ONLY),
+        (OptimizationLevel.O3, CUDAGraphMode.FULL_DECODE_ONLY),
+    ],
+)
+def test_noncompiled_cudagraph_fallback_respects_optimization_level(
+    monkeypatch, optimization_level, expected_cudagraph_mode
+):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        compilation_config=CompilationConfig(),
+        optimization_level=optimization_level,
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: False
+    config._has_breakable_cudagraph_architecture = lambda: (
+        VllmConfig._has_breakable_cudagraph_architecture(config)
+    )
+
+    assert not VllmConfig._maybe_enable_breakable_cudagraph(config)
+    assert config.compilation_config.mode == CompilationMode.NONE
+    assert config.compilation_config.cudagraph_mode == expected_cudagraph_mode
+
+
+@pytest.mark.parametrize(
+    "explicit_mode",
+    [
+        CUDAGraphMode.NONE,
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    ],
+)
+def test_noncompiled_cudagraph_fallback_preserves_explicit_mode(
+    monkeypatch, explicit_mode
+):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+        compilation_config=CompilationConfig(cudagraph_mode=explicit_mode),
+        optimization_level=OptimizationLevel.O2,
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: False
+    config._has_breakable_cudagraph_architecture = lambda: (
+        VllmConfig._has_breakable_cudagraph_architecture(config)
+    )
+
+    assert not VllmConfig._maybe_enable_breakable_cudagraph(config)
+
+    assert config.compilation_config.cudagraph_mode == explicit_mode
+    expected_compilation_mode = (
+        None if explicit_mode.requires_piecewise_compilation() else CompilationMode.NONE
+    )
+    assert config.compilation_config.mode == expected_compilation_mode
+
+
+def test_noncompiled_cudagraph_fallback_preserves_explicit_compilation_mode(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        compilation_config=CompilationConfig(mode=CompilationMode.VLLM_COMPILE),
+        optimization_level=OptimizationLevel.O2,
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: False
+    config._has_breakable_cudagraph_architecture = lambda: (
+        VllmConfig._has_breakable_cudagraph_architecture(config)
+    )
+
+    assert not VllmConfig._maybe_enable_breakable_cudagraph(config)
+
+    assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+
+
+def test_noncompiled_cudagraph_fallback_does_not_change_compiled_model(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        compilation_config=CompilationConfig(),
+        optimization_level=OptimizationLevel.O2,
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: False
+    config._has_breakable_cudagraph_architecture = lambda: (
+        VllmConfig._has_breakable_cudagraph_architecture(config)
+    )
+
+    assert not VllmConfig._maybe_enable_breakable_cudagraph(config)
+
+    assert config.compilation_config.mode is None
+    assert config.compilation_config.cudagraph_mode is None
+
+
+def test_noncompiled_cudagraph_fallback_not_used_when_breakable_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        compilation_config=CompilationConfig(),
+        optimization_level=OptimizationLevel.O2,
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: False
+    config._has_breakable_cudagraph_architecture = lambda: (
+        VllmConfig._has_breakable_cudagraph_architecture(config)
+    )
+
+    assert VllmConfig._maybe_enable_breakable_cudagraph(config)
+    assert config.compilation_config.mode == CompilationMode.NONE
+    assert config.compilation_config.cudagraph_mode is None
+
+
+def test_late_piecewise_override_without_capture_provider_falls_back_to_none(
+    monkeypatch,
+):
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        cudagraph_capture_sizes=[1, 2, 4],
+        max_cudagraph_capture_size=4,
+    )
+    config = SimpleNamespace(compilation_config=compilation_config)
+
+    VllmConfig._disable_unavailable_piecewise_cudagraphs(config)
+
+    assert compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert compilation_config.cudagraph_capture_sizes == []
+    assert compilation_config.max_cudagraph_capture_size == 0
 
 
 @pytest.mark.parametrize(
